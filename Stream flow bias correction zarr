@@ -1,0 +1,142 @@
+import os
+import pandas as pd
+import xarray as xr
+from geoglows.bias import correct_historical
+from joblib import Parallel, delayed
+from tqdm import tqdm
+
+# Add path to your Zarr file
+zarr_path = '/Users/yubinbaaniya/Documents/WORLD BIAS/saber workdir/2nd_iteration_simulation_data.zarr'
+observed_data_folder = '/Users/yubinbaaniya/Documents/WORLD BIAS/saber workdir/gauge_data'
+output_folder = '/Users/yubinbaaniya/Documents/WORLD BIAS/saber workdir/Bias corrected Time series/1941 dekhi/Jorge bias corrected output'
+
+# Ensure output folder exists
+os.makedirs(output_folder, exist_ok=True)
+
+# Load the CSV file
+file_path = '/Users/yubinbaaniya/Documents/WORLD BIAS/saber workdir/gauge_table_2nd_iteration_deDuplicated.csv'
+data = pd.read_csv(file_path)
+
+
+# Add thread-safe list handling
+class ThreadSafeList:
+    def __init__(self):
+        self.list = []
+        self.lock = Lock()
+
+    def append(self, item):
+        with self.lock:
+            self.list.append(item)
+
+    def get_list(self):
+        with self.lock:
+            return self.list.copy()
+
+def clean_data(df, column_name):
+    """Clean dataframe by removing invalid values"""
+    df[column_name] = pd.to_numeric(df[column_name], errors='coerce')
+    df = df[df[column_name] >= 0]
+    df = df.dropna(subset=[column_name])
+    return df
+
+
+def get_simulated_data(ds, rivid):
+    """
+    Extract time series for a specific rivid from Zarr dataset starting from 1941
+
+    Args:
+        ds (xarray.Dataset): The zarr dataset
+        rivid (int): River ID to extract
+
+    Returns:
+        pandas.DataFrame: Time series data for the specified rivid from 1941 onwards
+    """
+    try:
+        # Select data for the specific rivid and time period
+        sim_data = ds.sel(
+            rivid=rivid,
+            time=slice('1941-01-01', None)  # From 1941-01-01 to the end of the dataset
+        )['Qout'].to_dataframe()
+
+        # Reset index to make time a column
+        sim_data = sim_data.reset_index()
+        # Set time as index
+        sim_data = sim_data.set_index('time')
+        return sim_data
+    except KeyError:
+        print(f"rivid {rivid} not found in dataset")
+        return None
+
+
+def process_row(row, ds, skipped_rows, completed_rows):
+    """Process a single row with Zarr dataset input"""
+    try:
+        # Get simulated data from Zarr
+        rivid = int(row['model_id'])  # Assuming 'linkno' contains rivid
+        simulated_data = get_simulated_data(ds, rivid)
+        simulated_data = simulated_data.drop(columns='rivid')
+
+        if simulated_data is None:
+            skipped_rows.append(row['gauge_id'])
+            return
+
+        # Load observed data (keeping original CSV format for observed data)
+        observed_file_path = os.path.join(observed_data_folder, f"{row['gauge_id']}.csv")
+
+        if not os.path.exists(observed_file_path):
+            skipped_rows.append(row['gauge_id'])
+            return
+
+        observed_data = pd.read_csv(observed_file_path, index_col=0, parse_dates=True)
+
+        # Clean the data
+        simulated_data = clean_data(simulated_data, 'Qout')
+        observed_data = clean_data(observed_data, 'Streamflow (m3/s)')
+
+        # Perform bias correction
+        corrected_data = correct_historical(simulated_data, observed_data)
+
+        # Save the resultant dataframe
+        output_file_path = os.path.join(output_folder, f"{row['model_id']}.csv")
+        corrected_data.to_csv(output_file_path)
+
+        completed_rows.append(row['gauge_id'])
+        print(f"Bias correction completed for: {row['gauge_id']}")
+
+    except Exception as e:
+        print(f"Error processing {row['model_id']}: {e}")
+        skipped_rows.append(row['model_id'])
+
+
+def main():
+    """Main function to run parallel bias correction"""
+    # Load the zarr dataset
+    print("Loading Zarr dataset...")
+    ds = xr.open_zarr(zarr_path)
+
+    # Load the station data
+    data = pd.read_csv(file_path)
+    rows = [row for index, row in data.iterrows()]
+
+    skipped_rows = []
+    completed_rows = []
+
+    # Run parallel processing with progress bar
+    Parallel(n_jobs=-1)(delayed(process_row)(row, ds, skipped_rows, completed_rows)
+                        for row in tqdm(rows))
+
+    # Save skipped rows and print summary
+    pd.DataFrame(skipped_rows, columns=['model_id']).to_csv(
+        os.path.join(output_folder, 'skipped_rows.csv'),
+        index=False
+    )
+
+    for completed_file in completed_rows:
+        print(f"Bias corrected: {completed_file}")
+
+    print("All tasks completed.")
+    print(f"Skipped rows: {skipped_rows}")
+
+
+if __name__ == "__main__":
+    main()
